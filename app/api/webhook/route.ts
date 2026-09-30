@@ -41,7 +41,7 @@ async function createReply(message: string, apiKey: string) {
         "あなたはLINEのAI秘書「たくてぃAI」です。" +
         "日本語で親しみやすく、要点から簡潔に答えてください。" +
         "予定の整理、文章作成、相談を手伝います。" +
-        "現在は会話履歴、カレンダー、メール、外部検索には接続されていません。" +
+        "「今日の予定」「明日の予定」とそのまま送ると、専用処理がGoogleのメインカレンダーを日本時間で確認します。それ以外の予定確認では、この2つの送信方法を案内してください。この通常会話には実際の予定データは渡されないので、予定の内容や有無を推測しないでください。予定の登録・変更・削除、会話履歴、メール、外部検索には対応していません。" +
         "実際には行っていない予約、保存、送信、検索を完了したと言わないでください。" +
         "不明なことは不明と伝え、必要なら短く質問してください。",
       input: message,
@@ -79,7 +79,143 @@ async function createReply(message: string, apiKey: string) {
   return text.length > 4500 ? text.slice(0, 4499) + "…" : text;
 }
 
-export async function GET() {
+async function calendarReply(message: string): Promise<string | null> {
+  const command = message.trim();
+  if (command !== "今日の予定" && command !== "明日の予定") {
+    return null;
+  }
+
+  const clientId = process.env.GOOGLE_CLIENT_ID?.trim();
+  const clientSecret = process.env.GOOGLE_CLIENT_SECRET?.trim();
+  const refreshToken = process.env.GOOGLE_REFRESH_TOKEN?.trim();
+
+  if (!clientId || !clientSecret || !refreshToken) {
+    return "カレンダーの接続設定がまだ反映されていません。";
+  }
+
+  try {
+    const tokenResponse = await fetch("https://oauth2.googleapis.com/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        client_id: clientId,
+        client_secret: clientSecret,
+        refresh_token: refreshToken,
+        grant_type: "refresh_token",
+      }),
+      signal: AbortSignal.timeout(10000),
+      cache: "no-store",
+    });
+
+    if (!tokenResponse.ok) {
+      return "Googleとの接続を更新できませんでした。接続設定の確認が必要です。";
+    }
+
+    const token = (await tokenResponse.json()) as { access_token?: string };
+    if (!token.access_token) throw new Error("Missing access token");
+
+    const dayMs = 86400000;
+    const japanOffset = 9 * 60 * 60 * 1000;
+    const dayOffset = command === "明日の予定" ? 1 : 0;
+    const startMs =
+      Math.floor((Date.now() + japanOffset) / dayMs) * dayMs -
+      japanOffset +
+      dayOffset * dayMs;
+
+    const dateLabel = new Intl.DateTimeFormat("ja-JP", {
+      timeZone: "Asia/Tokyo",
+      month: "numeric",
+      day: "numeric",
+      weekday: "short",
+    }).format(new Date(startMs));
+
+    const url = new URL(
+      "https://www.googleapis.com/calendar/v3/calendars/primary/events"
+    );
+    url.search = new URLSearchParams({
+      timeMin: new Date(startMs).toISOString(),
+      timeMax: new Date(startMs + dayMs).toISOString(),
+      timeZone: "Asia/Tokyo",
+      singleEvents: "true",
+      orderBy: "startTime",
+      showDeleted: "false",
+      maxResults: "21",
+      fields: "items(status,summary,location,start,end),nextPageToken",
+    }).toString();
+
+    const response = await fetch(url, {
+      headers: { Authorization: `Bearer ${token.access_token}` },
+      signal: AbortSignal.timeout(10000),
+      cache: "no-store",
+    });
+
+    if (!response.ok) {
+      return "予定を取得できませんでした。Google側の権限や接続設定を確認してください。";
+    }
+
+    type CalendarEvent = {
+      status?: string;
+      summary?: string;
+      location?: string;
+      start?: { date?: string; dateTime?: string };
+      end?: { date?: string; dateTime?: string };
+    };
+
+    const data = (await response.json()) as {
+      items?: CalendarEvent[];
+      nextPageToken?: string;
+    };
+    const events = (data.items ?? []).filter(
+      (event) => event.status !== "cancelled"
+    );
+    const heading = `${dateLabel}の予定（日本時間・メインカレンダー）`;
+
+    if (events.length === 0) {
+      return data.nextPageToken
+        ? `${heading}\n予定一覧を最後まで取得できませんでした。Googleカレンダーでも確認してください。`
+        : `${heading}\nこのカレンダーには予定がありません。`;
+    }
+
+    const clock = new Intl.DateTimeFormat("ja-JP", {
+      timeZone: "Asia/Tokyo",
+      month: "numeric",
+      day: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+      hourCycle: "h23",
+    });
+
+    const lines = events.slice(0, 20).map((event) => {
+      const title = (event.summary || "タイトルなし")
+        .replace(/\s+/g, " ")
+        .slice(0, 80);
+      const location = (event.location || "")
+        .replace(/\s+/g, " ")
+        .slice(0, 60);
+
+      let time = "時刻未設定";
+      if (event.start?.date) {
+        time = "終日";
+      } else if (event.start?.dateTime) {
+        time = clock.format(new Date(event.start.dateTime));
+        if (event.end?.dateTime) {
+          time += `〜${clock.format(new Date(event.end.dateTime))}`;
+        }
+      }
+
+      return `・${time} ${title}${location ? `\n  場所：${location}` : ""}`;
+    });
+
+    const more =
+      events.length > 20 || data.nextPageToken
+        ? "\n\n※一部の予定のみ表示しています。続きはGoogleカレンダーで確認してください。"
+        : "";
+
+    return `${heading}\n\n${lines.join("\n\n")}${more}`;
+  } catch {
+    return "予定の取得中に問題が起きました。少し待ってから、もう一度試してください。";
+  }
+}export async function GET() {
   return Response.json({ status: "ok" });
 }
 
@@ -174,7 +310,9 @@ let replyText: string;
     "リンクは10分間有効です。他の人には共有しないでね。\n\n" +
     connectUrl.toString();
 } else {
-  replyText = await createReply(event.message.text, apiKey);
+ replyText =
+  (await calendarReply(event.message.text)) ??
+  (await createReply(event.message.text, apiKey));
 }
       } catch {
         console.error("AI reply generation failed");
