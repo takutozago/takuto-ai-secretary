@@ -153,7 +153,29 @@ if (
 let replyText: string;
 
       try {
-        replyText = await createReply(event.message.text, apiKey);
+        if (event.message.text.trim() === "カレンダー連携") {
+  const redirectUri = process.env.GOOGLE_REDIRECT_URI;
+  if (!redirectUri) {
+    throw new Error("Google redirect URI missing");
+  }
+
+  const expires = String(Math.floor(Date.now() / 1000) + 600);
+  const signature = createHmac("sha256", secret)
+    .update(`google-connect:${allowedUserId}:${expires}`)
+    .digest("hex");
+
+  const connectUrl = new URL("/api/google/start", redirectUri);
+  connectUrl.searchParams.set("expires", expires);
+  connectUrl.searchParams.set("signature", signature);
+
+  replyText =
+    "Googleカレンダーを連携するには、下のリンクをSafariまたはChromeで開いてね。\n" +
+    "普段カレンダーを使っているGoogleアカウントで、予定の読み取りを許可してください。\n" +
+    "リンクは10分間有効です。他の人には共有しないでね。\n\n" +
+    connectUrl.toString();
+} else {
+  replyText = await createReply(event.message.text, apiKey);
+}
       } catch {
         console.error("AI reply generation failed");
         replyText =
