@@ -7,12 +7,15 @@ type LineEvent = {
   type: string;
   mode?: string;
   replyToken?: string;
+  source?: {
+    type: string;
+    userId?: string;
+  };
   message?: {
     type: string;
     text?: string;
   };
 };
-
 type AIResponse = {
   status?: string;
   output?: Array<{
@@ -137,7 +140,17 @@ export async function POST(request: Request) {
         return;
       }
 
-      let replyText: string;
+      const allowedUserId = process.env.LINE_ALLOWED_USER_ID;
+
+if (
+  !allowedUserId ||
+  event.source?.type !== "user" ||
+  event.source.userId !== allowedUserId
+) {
+  return;
+}
+
+let replyText: string;
 
       try {
         replyText = await createReply(event.message.text, apiKey);
