@@ -41,7 +41,7 @@ async function createReply(message: string, apiKey: string) {
         "あなたはLINEのAI秘書「たくてぃAI」です。" +
         "日本語で親しみやすく、要点から簡潔に答えてください。" +
         "予定の整理、文章作成、相談を手伝います。" +
-        "「今日の予定」「明日の予定」とそのまま送ると、専用処理がGoogleのメインカレンダーを日本時間で確認します。それ以外の予定確認では、この2つの送信方法を案内してください。この通常会話には実際の予定データは渡されないので、予定の内容や有無を推測しないでください。予定の登録・変更・削除、会話履歴、メール、外部検索には対応していません。" +
+        "「今日の予定」「明日の予定を教えて」「今週の予定」「来週の予定」「10月5日の予定」「2027/1/5の予定」で、専用処理がGoogleのメインカレンダーを日本時間で確認します。週は月曜から日曜、年を省いた日付は今年です。それ以外の予定確認では、対応する送信方法か「使い方」を案内してください。この通常会話には実際の予定データは渡されないので、予定の内容や有無を推測しないでください。予定の登録・変更・削除、会話履歴、メール、外部検索には対応していません。" +
         "実際には行っていない予約、保存、送信、検索を完了したと言わないでください。" +
         "不明なことは不明と伝え、必要なら短く質問してください。",
       input: message,
@@ -79,11 +79,56 @@ async function createReply(message: string, apiKey: string) {
   return text.length > 4500 ? text.slice(0, 4499) + "…" : text;
 }
 
-async function calendarReply(message: string): Promise<string | null> {
-  const command = message.trim();
-  if (command !== "今日の予定" && command !== "明日の予定") {
-    return null;
+const CALENDAR_DAY_MS = 86400000;
+const CALENDAR_JST_OFFSET = 9 * 60 * 60 * 1000;
+
+function calendarRange(message: string, now = Date.now()):
+  { startMs: number; endMs: number } | string | null {
+  const command = message.normalize("NFKC").replace(/\s+/g, "")
+    .replace(/[?？!！。]+$/, "")
+    .replace(/(?:を教えてください|を教えて|教えてください|教えて|を確認して|を見せて|は)$/, "");
+  const today = Math.floor((now + CALENDAR_JST_OFFSET) / CALENDAR_DAY_MS)
+    * CALENDAR_DAY_MS - CALENDAR_JST_OFFSET;
+  const relative: Record<string, number> = {
+    "昨日": -1, "今日": 0, "明日": 1, "明後日": 2, "あさって": 2,
+  };
+  const relativeMatch = command.match(/^(昨日|今日|明日|明後日|あさって)の?(?:予定|スケジュール)$/);
+  if (relativeMatch) {
+    const startMs = today + relative[relativeMatch[1]] * CALENDAR_DAY_MS;
+    return { startMs, endMs: startMs + CALENDAR_DAY_MS };
   }
+  const weekMatch = command.match(/^(今週|来週)の?(?:予定|スケジュール)$/);
+  if (weekMatch) {
+    const weekday = new Date(today + CALENDAR_JST_OFFSET).getUTCDay();
+    const mondayOffset = -((weekday + 6) % 7);
+    const startMs = today + (mondayOffset + (weekMatch[1] === "来週" ? 7 : 0))
+      * CALENDAR_DAY_MS;
+    return { startMs, endMs: startMs + 7 * CALENDAR_DAY_MS };
+  }
+  const explicit = command.match(/^(\d{4})[/-](\d{1,2})[/-](\d{1,2})の?(?:予定|スケジュール)$/)
+    ?? command.match(/^(\d{4})年(\d{1,2})月(\d{1,2})日の?(?:予定|スケジュール)$/);
+  const short = command.match(/^(\d{1,2})\/(\d{1,2})の?(?:予定|スケジュール)$/)
+    ?? command.match(/^(\d{1,2})月(\d{1,2})日の?(?:予定|スケジュール)$/);
+  if (!explicit && !short) return null;
+  const year = explicit ? Number(explicit[1])
+    : new Date(today + CALENDAR_JST_OFFSET).getUTCFullYear();
+  const month = Number(explicit ? explicit[2] : short![1]);
+  const day = Number(explicit ? explicit[3] : short![2]);
+  const date = new Date(Date.UTC(year, month - 1, day));
+  if (year < 2000 || year > 2100 || date.getUTCFullYear() !== year
+      || date.getUTCMonth() !== month - 1 || date.getUTCDate() !== day) {
+    return "その日付は確認できませんでした。例：2026/10/5の予定 のように、実在する日付を送ってね。";
+  }
+  const startMs = date.getTime() - CALENDAR_JST_OFFSET;
+  return { startMs, endMs: startMs + CALENDAR_DAY_MS };
+}
+
+async function calendarReply(message: string): Promise<string | null> {
+  if (["使い方", "ヘルプ"].includes(message.trim())) {
+    return "予定確認の例：\n・今日の予定\n・明日の予定を教えて\n・今週の予定\n・来週の予定\n・10月5日の予定\n・2027/1/5の予定\n\n日本時間・メインカレンダーが対象です。週は月曜〜日曜、年を省いた日付は今年として確認します。登録・変更・削除にはまだ対応していません。";
+  }
+  const range = calendarRange(message);
+  if (range === null || typeof range === "string") return range;
 
   const clientId = process.env.GOOGLE_CLIENT_ID?.trim();
   const clientSecret = process.env.GOOGLE_CLIENT_SECRET?.trim();
@@ -114,27 +159,21 @@ async function calendarReply(message: string): Promise<string | null> {
     const token = (await tokenResponse.json()) as { access_token?: string };
     if (!token.access_token) throw new Error("Missing access token");
 
-    const dayMs = 86400000;
-    const japanOffset = 9 * 60 * 60 * 1000;
-    const dayOffset = command === "明日の予定" ? 1 : 0;
-    const startMs =
-      Math.floor((Date.now() + japanOffset) / dayMs) * dayMs -
-      japanOffset +
-      dayOffset * dayMs;
-
-    const dateLabel = new Intl.DateTimeFormat("ja-JP", {
-      timeZone: "Asia/Tokyo",
-      month: "numeric",
-      day: "numeric",
-      weekday: "short",
-    }).format(new Date(startMs));
+    const { startMs, endMs } = range;
+    const dateFormat = new Intl.DateTimeFormat("ja-JP", {
+      timeZone: "Asia/Tokyo", year: "numeric",
+      month: "numeric", day: "numeric", weekday: "short",
+    });
+    const dateLabel = dateFormat.format(new Date(startMs)) +
+      (endMs - startMs > CALENDAR_DAY_MS
+        ? "〜" + dateFormat.format(new Date(endMs - CALENDAR_DAY_MS)) : "");
 
     const url = new URL(
       "https://www.googleapis.com/calendar/v3/calendars/primary/events"
     );
     url.search = new URLSearchParams({
       timeMin: new Date(startMs).toISOString(),
-      timeMax: new Date(startMs + dayMs).toISOString(),
+      timeMax: new Date(endMs).toISOString(),
       timeZone: "Asia/Tokyo",
       singleEvents: "true",
       orderBy: "startTime",
@@ -195,7 +234,12 @@ async function calendarReply(message: string): Promise<string | null> {
 
       let time = "時刻未設定";
       if (event.start?.date) {
-        time = "終日";
+        time = dateFormat.format(new Date(event.start.date + "T00:00:00+09:00")) + " 終日";
+        if (event.end?.date) {
+          const lastDay = new Date(event.end.date + "T00:00:00+09:00").getTime() - CALENDAR_DAY_MS;
+          const firstDay = new Date(event.start.date + "T00:00:00+09:00").getTime();
+          if (lastDay > firstDay) time += "（〜" + dateFormat.format(new Date(lastDay)) + "）";
+        }
       } else if (event.start?.dateTime) {
         time = clock.format(new Date(event.start.dateTime));
         if (event.end?.dateTime) {
@@ -215,7 +259,9 @@ async function calendarReply(message: string): Promise<string | null> {
   } catch {
     return "予定の取得中に問題が起きました。少し待ってから、もう一度試してください。";
   }
-}export async function GET() {
+}
+
+export async function GET() {
   return Response.json({ status: "ok" });
 }
 
